@@ -10,7 +10,7 @@ module hci
 ! improve the energy estimate, using epsilon2 to avoid wasting time on small contributions
 ! to the sum.
 ! A Holmes, Started on 7 Feb 2016
-
+use omp_lib
 use types, only : rk,ik,ik_vec,i8b
 use common_ham, only : nup,ndn,norb,n_core_orb,hamiltonian_type
 #ifdef NUM_ORBITALS_GT_127
@@ -368,7 +368,8 @@ contains
 
     n_conn_estimate = estimate_n_connections(ndets_old,old_dets_up,old_dets_dn,old_wts,pt_eps)
     write (6,*) "Estimated number of connections to variational wavefunction=",n_conn_estimate; call flush(6)
-    n_batches = max(1,n_conn_estimate/10**8)
+    n_batches = max(8,n_conn_estimate/10**8)
+    ! n_batches = max(1,n_conn_estimate/10**8)
     write (6,*) "Performing 1-RDM calculation in",n_batches,"batches"; call flush(6)
 
     call get_1rdm(ndets_old,old_dets_up,old_dets_dn,old_wts,rdm)
@@ -378,7 +379,8 @@ contains
    !call second_order_pt_ah(ndets_old,old_dets_up,old_dets_dn,old_wts,diag_elems,energy,pt_eps)
     n_conn_estimate = estimate_n_connections(ndets_old,old_dets_up,old_dets_dn,old_wts,pt_eps)
     write (6,*) "Estimated number of connections to variational wavefunction=",n_conn_estimate; call flush(6)
-    n_batches = max(1,n_conn_estimate/10**8)
+    n_batches = max(8,n_conn_estimate/10**8)
+    ! n_batches = max(1,n_conn_estimate/10**8)
     write (6,*) "Performing PT correction in",n_batches,"batches"; call flush(6)
     call second_order_pt_dtm_batches(ndets_old,old_dets_up,old_dets_dn,old_wts,diag_elems,energy,pt_eps,n_batches) !,iorder,temp_i16_up,temp_i16_dn,temp_i_2)
 
@@ -670,7 +672,7 @@ contains
     real(rk),intent(in) :: wts(:),diag_elems(:),var_energy,epsilon
     integer,intent(in) :: n_batches
 
-    real(rk) :: delta_e_2pt
+    real(rk) :: delta_e_2pt, delta_e_2pt_inc
     real(rk),allocatable :: connected_wts_i(:),new_diag_elems_i(:),e_mix_den_i(:)
     real(rk),allocatable :: connected_wts_j(:),new_diag_elems_j(:),e_mix_den_j(:)
     integer :: i,j,ndets_connected,ndets_connected_i,ndets_connected_j
@@ -705,6 +707,13 @@ contains
     delta_e_2pt = 0._rk
     ndets_connected = 0
 
+    write (*, '("master threads: ", I2)') omp_get_num_threads()
+        
+    call omp_set_num_threads(8)
+
+    !$omp parallel default(shared)
+    !$omp single
+
     do ibatch=1,n_batches
 
       call find_doubly_excited(n_det=ndets_connected_i,dets_up=connected_dets_up_i,dets_dn=connected_dets_dn_i,ref_up=dets_up(ibatch:ndets:n_batches),ref_dn=dets_dn(ibatch:ndets:n_batches),norb=norb,n_core_orb=n_core_orb,ref_coeffs=wts(ibatch:ndets:n_batches),e_mix_num=connected_wts_i,e_mix_den=e_mix_den_i,min_elem=epsilon,ref_diag_elems=diag_elems(ibatch:ndets:n_batches),new_diag_elems=new_diag_elems_i)
@@ -712,43 +721,72 @@ contains
       do jbatch=ibatch,n_batches
 
         call find_doubly_excited(n_det=ndets_connected_j,dets_up=connected_dets_up_j,dets_dn=connected_dets_dn_j,ref_up=dets_up(jbatch:ndets:n_batches),ref_dn=dets_dn(jbatch:ndets:n_batches),norb=norb,n_core_orb=n_core_orb,ref_coeffs=wts(jbatch:ndets:n_batches),e_mix_num=connected_wts_j,e_mix_den=e_mix_den_j,min_elem=epsilon,ref_diag_elems=diag_elems(jbatch:ndets:n_batches),new_diag_elems=new_diag_elems_j)
-    
-        j=1
+
+
+        !$omp task &
+        !$omp& default(none) &
+        !$omp& private(j, k, delta_e_2pt_inc) &
+        !$omp& firstprivate(n_batches, ndets, ibatch, jbatch, var_energy) &
+        !$omp& shared(ndets_connected_i, ndets_connected_j) &
+        !$omp& shared(connected_dets_up_i, connected_dets_up_j, connected_dets_dn_i, connected_dets_dn_j) &
+        !$omp& shared(sorted_dets_up, sorted_dets_dn, connected_wts_i, connected_wts_j) &
+        !$omp& shared(new_diag_elems_i, e_mix_den_i) &
+        !$omp& shared(delta_e_2pt)
+        write (*, *) omp_get_wtime()
+        write (*, '("worker in task: ", I2, "/", I2, "/", I2, " is processing batch: ", I8, I8)'), omp_get_thread_num(), omp_get_num_threads(), omp_get_max_threads(), ibatch, jbatch
+        
+        j = 1
+        delta_e_2pt_inc = 0.0_rk
+
+        write (*, *) "about to start"
+
         do i=1,ndets_connected_i
           ! Increment j until it is no longer smaller than i
           do while (connected_dets_up_i(i)>connected_dets_up_j(j).or.(connected_dets_up_i(i)==connected_dets_up_j(j).and.connected_dets_dn_i(i)>connected_dets_dn_j(j)))
             if (j==ndets_connected_j)  exit
             j = j+1
           enddo
+          write (*, *) "in loop"
           if (connected_dets_up_i(i)==connected_dets_up_j(j).and.connected_dets_dn_i(i)==connected_dets_dn_j(j)) then
             if (n_batches>1) then
               call binary_search(connected_dets_up_i(i),connected_dets_dn_i(i),sorted_dets_up(1:ndets),sorted_dets_dn(1:ndets),k)
               if (k==0) then
                 if (ibatch==jbatch) then
-                  delta_e_2pt = delta_e_2pt + connected_wts_i(i)*connected_wts_j(j)/(var_energy-new_diag_elems_i(i))
+                  delta_e_2pt_inc = delta_e_2pt_inc + connected_wts_i(i)*connected_wts_j(j)/(var_energy-new_diag_elems_i(i))
                 else
-                  delta_e_2pt = delta_e_2pt + 2*connected_wts_i(i)*connected_wts_j(j)/(var_energy-new_diag_elems_i(i))
+                  delta_e_2pt_inc = delta_e_2pt_inc + 2*connected_wts_i(i)*connected_wts_j(j)/(var_energy-new_diag_elems_i(i))
                 endif
                !write (6,*) i,connected_dets_up_i(i),connected_dets_dn_i(i),connected_wts_i(i),new_diag_elems_i(i),connected_wts_i(i)**2/(var_energy-new_diag_elems_i(i)),delta_e_2pt
               endif
             else ! n_batches==1
               if (e_mix_den_i(i)==0._rk) then
                 if (ibatch==jbatch) then
-                  delta_e_2pt = delta_e_2pt + connected_wts_i(i)*connected_wts_j(j)/(var_energy-new_diag_elems_i(i))
+                  delta_e_2pt_inc = delta_e_2pt_inc + connected_wts_i(i)*connected_wts_j(j)/(var_energy-new_diag_elems_i(i))
                 else
-                  delta_e_2pt = delta_e_2pt + 2*connected_wts_i(i)*connected_wts_j(j)/(var_energy-new_diag_elems_i(i))
+                  delta_e_2pt_inc = delta_e_2pt_inc + 2*connected_wts_i(i)*connected_wts_j(j)/(var_energy-new_diag_elems_i(i))
                 endif
                !write (6,*) i,connected_dets_up_i(i),connected_dets_dn_i(i),connected_wts_i(i),new_diag_elems_i(i),connected_wts_i(i)**2/(var_energy-new_diag_elems_i(i)),delta_e_2pt
               endif
             endif
           endif
         enddo
+        write (*, *) "end loop"
+
+        !$omp critical
+        delta_e_2pt = delta_e_2pt + delta_e_2pt_inc
+        !$omp end critical
+
+        !$omp end task
+
 
       enddo
 
       ndets_connected = ndets_connected + ndets_connected_i
 
     enddo
+
+    !$omp end single
+    !$omp end parallel
 
     write (6,'(''Variational energy='',t36,f15.9)') var_energy
     write (6,'(''Second-order PT energy lowering='',t36,f15.9)') delta_e_2pt
